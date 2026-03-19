@@ -1,4 +1,4 @@
-﻿import json
+import json
 import os
 import re
 import sys
@@ -1313,79 +1313,184 @@ def run(
             },
             data=signup_body,
         )
-        emitter.info(f"注册表单提交状态: {signup_resp.status_code}", step="signup")
-        if signup_resp.status_code == 409:
-            emitter.warn(f"signup 409 响应: {str(signup_resp.text or '')[:220]}", step="signup")
+        # 解析 signup 响应，判断注册流程类型
+        signup_page_type = ""
+        try:
+            signup_data = signup_resp.json() if signup_resp.status_code == 200 else {}
+            signup_page_type = (signup_data.get("page") or {}).get("type", "")
+        except Exception:
+            pass
 
-        # ------- 步骤6：发送 OTP 验证码 -------
-        emitter.info("正在发送邮箱验证码...", step="send_otp")
-        otp_resp = _session_post(
-            "https://auth.openai.com/api/accounts/passwordless/send-otp",
-            headers={
-                "referer": "https://auth.openai.com/create-account/password",
-                "accept": "application/json",
-                "content-type": "application/json",
-            },
-        )
-        emitter.info(f"验证码发送状态: {otp_resp.status_code}", step="send_otp")
-        if otp_resp.status_code == 409:
-            emitter.warn(f"send_otp 409 响应: {str(otp_resp.text or '')[:220]}", step="send_otp")
+        if signup_page_type == "create_account_password":
+            # ===== 新流程：密码注册 =====
+            emitter.info("检测到密码注册流程（passwordless 已禁用）", step="set_password")
 
-        if otp_resp.status_code != 200:
-            emitter.error(f"验证码发送失败（状态码 {otp_resp.status_code}），跳过本轮", step="send_otp")
-            return None
-
-        if _stopped():
-            return None
-
-        # ------- 步骤7：轮询邮箱拿验证码 -------
-        if mail_provider is not None:
-            try:
-                code = mail_provider.wait_for_otp(
-                    dev_token,
-                    email,
-                    proxy=static_proxy,
-                    proxy_selector=mail_proxy_selector,
-                    stop_event=stop_event,
-                )
-            except TypeError:
-                code = mail_provider.wait_for_otp(
-                    dev_token,
-                    email,
-                    proxy=static_proxy,
-                    stop_event=stop_event,
-                )
-        else:
-            code = get_oai_code(
-                dev_token,
-                email,
-                static_proxies,
-                emitter,
-                stop_event,
-                proxy_selector=mail_proxies_selector,
+            # 生成随机强密码
+            alphabet = string.ascii_letters + string.digits + "!@#$%&*"
+            rand_password = ''.join(secrets.choice(alphabet) for _ in range(16))
+            # 确保密码包含大写、小写、数字、特殊字符
+            pwd_list = list(
+                secrets.choice(string.ascii_uppercase)
+                + secrets.choice(string.ascii_lowercase)
+                + secrets.choice(string.digits)
+                + secrets.choice("!@#$%&*")
+                + rand_password
             )
-        if not code:
-            return None
+            random.shuffle(pwd_list)
+            rand_password = ''.join(pwd_list)
+            emitter.info(f"已生成随机密码: {rand_password[:4]}{'*' * 12}", step="set_password")
 
-        if _stopped():
-            return None
+            if _stopped():
+                return None
 
-        # ------- 步骤8：提交验证码 -------
-        emitter.info("正在验证 OTP...", step="verify_otp")
-        code_body = f'{{"code":"{code}"}}'
-        code_resp = _session_post(
-            "https://auth.openai.com/api/accounts/email-otp/validate",
-            headers={
-                "referer": "https://auth.openai.com/email-verification",
-                "accept": "application/json",
-                "content-type": "application/json",
-            },
-            data=code_body,
-        )
-        emitter.info(f"验证码校验状态: {code_resp.status_code}", step="verify_otp")
+            # 提交密码 — 使用 /api/accounts/user/register 端点
+            emitter.info("正在提交密码注册...", step="set_password")
+            register_body = json.dumps({"username": email, "password": rand_password})
+            pwd_resp = _session_post(
+                "https://auth.openai.com/api/accounts/user/register",
+                headers={
+                    "referer": "https://auth.openai.com/create-account/password",
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                    "openai-sentinel-token": sentinel,
+                },
+                data=register_body,
+            )
+            emitter.info(f"密码注册状态: {pwd_resp.status_code}", step="set_password")
+            emitter.info(f"[DEBUG] 密码注册响应: {str(pwd_resp.text or '')[:500]}", step="set_password")
 
-        if _stopped():
-            return None
+            if pwd_resp.status_code not in (200, 301, 302):
+                emitter.error(f"密码注册失败（状态码 {pwd_resp.status_code}），跳过本轮", step="set_password")
+                return None
+
+            emitter.success("密码注册成功", step="set_password")
+
+            if _stopped():
+                return None
+
+            # 触发邮箱 OTP 发送
+            emitter.info("正在触发邮箱验证码发送...", step="verify_email")
+            try:
+                _session_get(
+                    "https://auth.openai.com/api/accounts/email-otp/send",
+                    headers={
+                        "referer": "https://auth.openai.com/create-account/password",
+                    },
+                    timeout=15,
+                )
+                _session_get(
+                    "https://auth.openai.com/email-verification",
+                    headers={
+                        "referer": "https://auth.openai.com/create-account/password",
+                    },
+                    timeout=15,
+                )
+            except Exception as e:
+                emitter.warn(f"触发 OTP 发送时异常（可能不影响）: {e}", step="verify_email")
+
+            # 轮询邮箱拿验证码
+            emitter.info("正在等待邮箱验证码...", step="verify_email")
+            if mail_provider is not None:
+                try:
+                    code = mail_provider.wait_for_otp(
+                        dev_token, email,
+                        proxy=static_proxy,
+                        proxy_selector=mail_proxy_selector,
+                        stop_event=stop_event,
+                    )
+                except TypeError:
+                    code = mail_provider.wait_for_otp(
+                        dev_token, email,
+                        proxy=static_proxy,
+                        stop_event=stop_event,
+                    )
+            else:
+                code = get_oai_code(
+                    dev_token, email, static_proxies, emitter, stop_event,
+                    proxy_selector=mail_proxies_selector,
+                )
+            if not code:
+                return None
+
+            if _stopped():
+                return None
+
+            # 提交验证码
+            emitter.info(f"正在验证 OTP: {code}", step="verify_email")
+            code_body = f'{{"code":"{code}"}}'
+            code_resp = _session_post(
+                "https://auth.openai.com/api/accounts/email-otp/validate",
+                headers={
+                    "referer": "https://auth.openai.com/email-verification",
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                },
+                data=code_body,
+            )
+            emitter.info(f"验证码校验状态: {code_resp.status_code}", step="verify_email")
+            emitter.info(f"[DEBUG] 验证码校验响应: {str(code_resp.text or '')[:500]}", step="verify_email")
+
+        else:
+            # ===== 旧流程：OTP 无密码注册 =====
+            # ------- 步骤6：发送 OTP 验证码 -------
+            emitter.info("正在发送邮箱验证码...", step="send_otp")
+            otp_resp = _session_post(
+                "https://auth.openai.com/api/accounts/passwordless/send-otp",
+                headers={
+                    "referer": "https://auth.openai.com/create-account/password",
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                },
+            )
+            emitter.info(f"验证码发送状态: {otp_resp.status_code}", step="send_otp")
+
+            if otp_resp.status_code != 200:
+                emitter.info(f"[DEBUG] send_otp 响应体: {str(otp_resp.text or '')[:500]}", step="send_otp")
+                emitter.error(f"验证码发送失败（状态码 {otp_resp.status_code}），跳过本轮", step="send_otp")
+                return None
+
+            if _stopped():
+                return None
+
+            # ------- 步骤7：轮询邮箱拿验证码 -------
+            if mail_provider is not None:
+                try:
+                    code = mail_provider.wait_for_otp(
+                        dev_token, email,
+                        proxy=static_proxy,
+                        proxy_selector=mail_proxy_selector,
+                        stop_event=stop_event,
+                    )
+                except TypeError:
+                    code = mail_provider.wait_for_otp(
+                        dev_token, email,
+                        proxy=static_proxy,
+                        stop_event=stop_event,
+                    )
+            else:
+                code = get_oai_code(
+                    dev_token, email, static_proxies, emitter, stop_event,
+                    proxy_selector=mail_proxies_selector,
+                )
+            if not code:
+                return None
+
+            if _stopped():
+                return None
+
+            # ------- 步骤8：提交验证码 -------
+            emitter.info("正在验证 OTP...", step="verify_otp")
+            code_body = f'{{"code":"{code}"}}'
+            code_resp = _session_post(
+                "https://auth.openai.com/api/accounts/email-otp/validate",
+                headers={
+                    "referer": "https://auth.openai.com/email-verification",
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                },
+                data=code_body,
+            )
+            emitter.info(f"验证码校验状态: {code_resp.status_code}", step="verify_otp")
 
         # ------- 步骤9：创建账户 -------
         emitter.info("正在创建账户信息...", step="create_account")
